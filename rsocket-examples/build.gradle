@@ -28,7 +28,9 @@ dependencies {
     testImplementation 'org.mockito:mockito-core'
     testImplementation 'org.assertj:assertj-core'
     testImplementation 'io.projectreactor:reactor-test'
-    testImplementation 'ch.qos.logback:logback-classic'
+
+    implementation 'org.slf4j:slf4j-api'
+    implementation 'ch.qos.logback:logback-classic'
 
     // TODO: Remove after JUnit5 migration
     testCompileOnly 'junit:junit'
