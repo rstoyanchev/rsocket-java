@@ -26,15 +26,19 @@ import reactor.core.CoreSubscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Operators;
+import reactor.util.annotation.Nullable;
 import reactor.util.context.Context;
 
-/** Default implementation of {@link WeightedRSocket} stored in {@link RSocketPool} */
+/**
+ * An RSocket stored in {@link RSocketPool} that can resolve the target RSocket to use from an
+ * {@link LoadbalanceRSocketSource}
+ */
 final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
-    implements CoreSubscriber<RSocket>, WeightedRSocket {
+    implements CoreSubscriber<RSocket>, RSocket {
 
   final RSocketPool parent;
   final LoadbalanceRSocketSource loadbalanceRSocketSource;
-  final Stats stats;
+  @Nullable final StatsTracker statsTracker;
 
   volatile Subscription s;
 
@@ -42,9 +46,11 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
       AtomicReferenceFieldUpdater.newUpdater(PooledWeightedRSocket.class, Subscription.class, "s");
 
   PooledWeightedRSocket(
-      RSocketPool parent, LoadbalanceRSocketSource loadbalanceRSocketSource, Stats stats) {
+      RSocketPool parent,
+      LoadbalanceRSocketSource loadbalanceRSocketSource,
+      LoadbalanceStrategy strategy) {
     this.parent = parent;
-    this.stats = stats;
+    this.statsTracker = strategy instanceof StatsTracker ? (StatsTracker) strategy : null;
     this.loadbalanceRSocketSource = loadbalanceRSocketSource;
   }
 
@@ -108,13 +114,12 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
 
   @Override
   protected void doOnValueResolved(RSocket value) {
-    stats.setAvailability(1.0);
+    statsTracker.onRSocketAvailable(this);
     value.onClose().subscribe(null, t -> this.invalidate(), this::invalidate);
   }
 
   @Override
   protected void doOnValueExpired(RSocket value) {
-    stats.setAvailability(0.0);
     value.dispose();
     this.dispose();
   }
@@ -157,7 +162,6 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
         break;
       }
     }
-    stats.setAvailability(0.0);
     Operators.terminate(S, this);
   }
 
@@ -186,23 +190,13 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
     return new RequestTrackingMonoInner<>(this, payload, FrameType.METADATA_PUSH);
   }
 
-  /**
-   * Indicates number of active requests
-   *
-   * @return number of requests in progress
-   */
-  @Override
-  public Stats stats() {
-    return stats;
-  }
-
   LoadbalanceRSocketSource source() {
     return loadbalanceRSocketSource;
   }
 
   @Override
   public double availability() {
-    return stats.availability();
+    return statsTracker != null ? statsTracker.getAvailabilityFor(this) : isDisposed() ? 0.0 : 1.0;
   }
 
   static final class RequestTrackingMonoInner<RESULT>
@@ -244,7 +238,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
             return;
         }
 
-        startTime = ((PooledWeightedRSocket) parent).stats.startRequest();
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        startTime = rsocketParent.statsTracker.startOfRequest(rsocketParent);
 
         source.subscribe((CoreSubscriber) this);
       } else {
@@ -256,9 +251,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
     public void onComplete() {
       final long state = this.requested;
       if (state != TERMINATED_STATE && REQUESTED.compareAndSet(this, state, TERMINATED_STATE)) {
-        final Stats stats = ((PooledWeightedRSocket) parent).stats;
-        final long now = stats.stopRequest(startTime);
-        stats.record(now - startTime);
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfRequest(startTime, null, rsocketParent);
         super.onComplete();
       }
     }
@@ -267,9 +261,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
     public void onError(Throwable t) {
       final long state = this.requested;
       if (state != TERMINATED_STATE && REQUESTED.compareAndSet(this, state, TERMINATED_STATE)) {
-        Stats stats = ((PooledWeightedRSocket) parent).stats;
-        stats.stopRequest(startTime);
-        stats.recordError(0.0);
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfRequest(startTime, t, rsocketParent);
         super.onError(t);
       }
     }
@@ -283,7 +276,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
 
       if (state == STATE_SUBSCRIBED) {
         this.s.cancel();
-        ((PooledWeightedRSocket) parent).stats.stopRequest(startTime);
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfRequest(startTime, null, rsocketParent);
       } else {
         this.parent.remove(this);
         ReferenceCountUtil.safeRelease(this.payload);
@@ -328,7 +322,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
             return;
         }
 
-        ((PooledWeightedRSocket) parent).stats.startStream();
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.startOfStream(rsocketParent);
 
         source.subscribe(this);
       } else {
@@ -340,7 +335,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
     public void onComplete() {
       final long state = this.requested;
       if (state != TERMINATED_STATE && REQUESTED.compareAndSet(this, state, TERMINATED_STATE)) {
-        ((PooledWeightedRSocket) parent).stats.stopStream();
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfStream(rsocketParent);
         super.onComplete();
       }
     }
@@ -349,7 +345,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
     public void onError(Throwable t) {
       final long state = this.requested;
       if (state != TERMINATED_STATE && REQUESTED.compareAndSet(this, state, TERMINATED_STATE)) {
-        ((PooledWeightedRSocket) parent).stats.stopStream();
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfStream(rsocketParent);
         super.onError(t);
       }
     }
@@ -363,7 +360,8 @@ final class PooledWeightedRSocket extends ResolvingOperator<RSocket>
 
       if (state == STATE_SUBSCRIBED) {
         this.s.cancel();
-        ((PooledWeightedRSocket) parent).stats.stopStream();
+        PooledWeightedRSocket rsocketParent = (PooledWeightedRSocket) parent;
+        rsocketParent.statsTracker.endOfStream(rsocketParent);
       } else {
         this.parent.remove(this);
         if (requestType == FrameType.REQUEST_STREAM) {

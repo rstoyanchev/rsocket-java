@@ -16,13 +16,16 @@
 
 package io.rsocket.loadbalance;
 
+import io.rsocket.RSocket;
 import java.util.List;
+import java.util.Map;
 import java.util.SplittableRandom;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 import reactor.util.annotation.Nullable;
 
-public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
+public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy, StatsTracker {
 
   private static final double EXP_FACTOR = 4.0;
 
@@ -31,6 +34,7 @@ public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
   final SplittableRandom splittableRandom;
   final int effort;
   final Supplier<Stats> statsSupplier;
+  final Map<RSocket, Stats> statsMap = new ConcurrentHashMap<>();
 
   public WeightedLoadbalanceStrategy() {
     this(EFFORT);
@@ -52,24 +56,19 @@ public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
   }
 
   @Override
-  public Supplier<Stats> statsSupplier() {
-    return this.statsSupplier;
-  }
-
-  @Override
-  public WeightedRSocket select(List<WeightedRSocket> sockets) {
+  public RSocket select(List<RSocket> sockets) {
     final int effort = this.effort;
     final int size = sockets.size();
 
-    WeightedRSocket weightedRSocket;
+    RSocket weightedRSocket;
     switch (size) {
       case 1:
         weightedRSocket = sockets.get(0);
         break;
       case 2:
         {
-          WeightedRSocket rsc1 = sockets.get(0);
-          WeightedRSocket rsc2 = sockets.get(1);
+          RSocket rsc1 = sockets.get(0);
+          RSocket rsc2 = sockets.get(1);
 
           double w1 = algorithmicWeight(rsc1);
           double w2 = algorithmicWeight(rsc2);
@@ -82,8 +81,8 @@ public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
         break;
       default:
         {
-          WeightedRSocket rsc1 = null;
-          WeightedRSocket rsc2 = null;
+          RSocket rsc1 = null;
+          RSocket rsc2 = null;
 
           for (int i = 0; i < effort; i++) {
             int i1 = ThreadLocalRandom.current().nextInt(size);
@@ -112,13 +111,12 @@ public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
     return weightedRSocket;
   }
 
-  private static double algorithmicWeight(@Nullable final WeightedRSocket weightedRSocket) {
-    if (weightedRSocket == null
-        || weightedRSocket.isDisposed()
-        || weightedRSocket.availability() == 0.0) {
+  private double algorithmicWeight(@Nullable final RSocket rsocket) {
+    if (rsocket == null || rsocket.isDisposed() || rsocket.availability() == 0.0) {
+      statsMap.remove(rsocket);
       return 0.0;
     }
-    final Stats stats = weightedRSocket.stats();
+    final Stats stats = statsMap.get(rsocket);
     final int pending = stats.pending();
     double latency = stats.predictedLatency();
 
@@ -135,11 +133,67 @@ public class WeightedLoadbalanceStrategy implements LoadbalanceStrategy {
       latency *= calculateFactor(latency, high, bandWidth);
     }
 
-    return weightedRSocket.availability() * 1.0 / (1.0 + latency * (pending + 1));
+    return rsocket.availability() * 1.0 / (1.0 + latency * (pending + 1));
   }
 
   private static double calculateFactor(final double u, final double l, final double bandWidth) {
     final double alpha = (u - l) / bandWidth;
     return Math.pow(1 + alpha, EXP_FACTOR);
+  }
+
+  @Override
+  public void onRSocketAvailable(RSocket rsocket) {
+    rsocket
+        .onClose()
+        .doOnTerminate(
+            () -> {
+              Stats stats = statsMap.remove(rsocket);
+              if (stats != null) {
+                stats.setAvailability(0.0);
+              }
+            });
+    statsMap.put(rsocket, statsSupplier.get());
+  }
+
+  @Override
+  public double getAvailabilityFor(RSocket rsocket) {
+    Stats stats = statsMap.get(rsocket);
+    return stats != null ? stats.availability() : 0.0;
+  }
+
+  @Override
+  public long startOfRequest(RSocket rsocket) {
+    Stats stats = statsMap.get(rsocket);
+    return stats != null ? stats.startRequest() : -1;
+  }
+
+  @Override
+  public void endOfRequest(long startTime, @Nullable Throwable t, RSocket rsocket) {
+    Stats stats = statsMap.get(rsocket);
+    if (stats != null) {
+      if (t != null) {
+        stats.stopRequest(startTime);
+        stats.recordError(0.0);
+      } else {
+        final long now = stats.stopRequest(startTime);
+        stats.record(now - startTime);
+      }
+    }
+  }
+
+  @Override
+  public void startOfStream(RSocket rsocket) {
+    Stats stats = statsMap.get(rsocket);
+    if (stats != null) {
+      stats.startStream();
+    }
+  }
+
+  @Override
+  public void endOfStream(RSocket rsocket) {
+    Stats stats = statsMap.get(rsocket);
+    if (stats != null) {
+      stats.stopStream();
+    }
   }
 }
